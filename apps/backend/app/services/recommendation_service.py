@@ -124,8 +124,8 @@ def _mentions_internal_table(sql: str) -> bool:
 
 
 async def _top_query(connection_id: uuid.UUID, db: AsyncSession) -> QueryMetric | None:
-    # Fetch a small candidate pool ordered by total_exec_time; filter out
-    # any query that touches a Zentrix-owned table (self-monitoring blindness).
+    # 1st source: persisted query_metrics (populated on TELEMETRY_POLL_INTERVAL_SECONDS cadence,
+    # default 60s). A freshly-run diagnosis can outrun this table; hence the live fallback below.
     statement = (
         select(QueryMetric)
         .where(
@@ -140,6 +140,40 @@ async def _top_query(connection_id: uuid.UUID, db: AsyncSession) -> QueryMetric 
     for row in rows:
         if not _mentions_internal_table(row.query_text or ""):
             return row
+
+    # 2nd source (fallback): live pg_stat_statements via the customer asyncpg pool.
+    # This closes the "fresh diagnosis, empty recommendation" gap when telemetry-collector
+    # has not yet persisted the top query into query_metrics.
+    try:
+        from app.db.customer_db import customer_connection_manager
+        from app.tools.pg_introspection import get_query_metrics as _live_get_query_metrics
+        pool = await customer_connection_manager.get_customer_pool(connection_id, db)
+        async with pool.acquire() as customer:
+            live_rows = await _live_get_query_metrics(customer, limit=20)
+        for r in live_rows:
+            text = (r.get("query") or "").strip()
+            if not text:
+                continue
+            lowered = text.lower()
+            if not (lowered.startswith("select") or lowered.startswith("with")):
+                continue
+            if _mentions_internal_table(text):
+                continue
+            # Build an ad-hoc QueryMetric-shaped object with the fields _candidate_from_query needs.
+            live_metric = type(
+                "LiveQueryMetric",
+                (),
+                {"query_text": text, "connection_id": connection_id},
+            )()
+            return live_metric  # type: ignore[return-value]
+    except Exception as exc:  # noqa: BLE001 — fallback is best-effort
+        try:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "Live pg_stat_statements fallback failed for connection %s: %s", connection_id, exc
+            )
+        except Exception:
+            pass
     return None
 
 

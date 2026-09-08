@@ -55,6 +55,47 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     else:
         logger.warning("Application database connection check returned non-healthy status on startup")
 
+    # ── ML feature1 self-heal: retrain if artifacts wiped (Bug 2) ────────────
+    # If the manifest is missing, the named volume was reset (docker-compose down -v,
+    # first-boot on a fresh volume, or manual purge). Kick off a one-shot trainer
+    # in the background so the diagnosis detail page ML panel populates without
+    # requiring the operator to run scripts/train_ml.py manually.
+    try:
+        from pathlib import Path as _Path
+        import asyncio as _asyncio
+        import os as _os
+        _artifacts_dir = _Path(
+            _os.getenv("FEATURE1_ARTIFACT_DIR", "/workspace/apps/backend/.artifacts")
+        )
+        _manifest = _artifacts_dir / "manifest.json"
+        if not _manifest.exists():
+            logger.warning(
+                "ML feature1 artifacts absent at %s — scheduling background self-heal trainer.",
+                _artifacts_dir,
+            )
+            _artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+            async def _self_heal_train() -> None:
+                try:
+                    from app.ml.train_feature1_bundle import collect_dataset, train_bundle
+                    _dsn = _os.getenv(
+                        "FAULT_LAB_DSN",
+                        "postgresql://fault_lab:fault_lab_dev_password@fault-lab-db:5432/fault_lab",
+                    )
+                    logger.info("ML self-heal: collecting labelled dataset from %s ...", _dsn)
+                    rows = await collect_dataset(_dsn)
+                    logger.info("ML self-heal: training bundle over %d rows ...", len(rows))
+                    await _asyncio.to_thread(train_bundle, rows, _artifacts_dir)
+                    logger.info("ML self-heal: artifacts written to %s", _artifacts_dir)
+                except Exception as exc:  # noqa: BLE001 — self-heal is best-effort
+                    logger.warning("ML self-heal trainer failed: %s", exc)
+
+            _asyncio.create_task(_self_heal_train())
+        else:
+            logger.info("ML feature1 artifacts present at %s — no retrain needed.", _artifacts_dir)
+    except Exception as exc:  # noqa: BLE001 — never let self-heal break startup
+        logger.warning("ML self-heal bootstrap check failed: %s", exc)
+
     yield
 
     # ── Shutdown ──
