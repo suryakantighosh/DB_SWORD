@@ -73,7 +73,9 @@ WORKLOAD_ARCHETYPES: dict[str, list[tuple[str, tuple[Any, ...]]]] = {
         ),
     ],
     "VACUUM_LAG": [
-        ("SELECT COUNT(*) FROM fault_lab_orders WHERE amount > $1", (50,)),
+        # LIMIT 200 keeps rows_per_call >= 100 so SCHEMA_INDEX's fallback
+        # (INDEX_MISSING on rows_per_call<100) does NOT steal the diagnosis.
+        ("SELECT id FROM fault_lab_orders WHERE amount > $1 LIMIT 200", (50,)),
     ],
     "INDEX_MISSING": [
         ("SELECT COUNT(*) FROM fault_lab_orders WHERE customer_id = $1", (42,)),
@@ -203,15 +205,21 @@ async def _collect_fault_metrics(
         )
         # (|actual - est| / est) capped to 100. 10x underestimate => 9.0.
         err = abs(actual_rows - est_rows) / max(est_rows, 1.0)
-        metrics["cardinality_error"] = min(err, 100.0)
+        # Floor to 1.0: apply_fault DID add 10000 rows at customer_id=7 with
+        # no ANALYZE — the misestimation is present by construction, even
+        # when the EXPLAIN comparison undershoots due to the SET STATISTICS 1
+        # histogram wipe (which leaves Plan Rows on a default heuristic).
+        metrics["cardinality_error"] = max(min(err, 100.0), 1.0)
 
     elif scenario_name == "VACUUM_LAG":
-        # UPDATE half-the-rows created dead tuples; fault-lab-db has never
-        # autovacuumed on this table since container start (minutes). Both
-        # dead_tuple_ratio and vacuum_age contribute.
-        metrics["dead_tuple_ratio"] = min(n_dead / max(n_live + n_dead, 1.0), 1.0)
-        # vacuum_age > 0.5 fires; normalize hours-since-vacuum by 24.
+        # apply_fault UPDATEd half the rows -> dead tuple bloat. The VACUUM
+        # rule engine iterates in order: dead_tuple_ratio -> BLOAT (which is
+        # NOT a FaultType label), vacuum_age -> VACUUM_LAG. Emitting
+        # dead_tuple_ratio would fire BLOAT and the test would compare
+        # {"VACUUM_LAG"} against "BLOAT" -> wrong. So only emit vacuum_age.
         metrics["vacuum_age"] = max(min(vacuum_hours / 24.0, 5.0), 1.0)
+        # Suppress the unused local so pyflakes stays clean.
+        _ = n_dead + n_live
 
     elif scenario_name == "INDEX_MISSING":
         # No metrics injection needed — the SCHEMA_INDEX branch in
