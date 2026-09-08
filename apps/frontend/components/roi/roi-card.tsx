@@ -3,7 +3,8 @@ import { CircleHelp, TrendingDown } from 'lucide-react'
 import type { RoiEntry } from '@/types/types'
 import { Card } from '@/components/ui/card'
 import { usd } from '@/lib/format'
-import { getConnectionName } from '@/hooks/use-connections'
+import { useConnectionsQuery } from '@/hooks/use-connections'
+import type { DatabaseConnection } from '@/types/types'
 import { cn } from '@/lib/utils'
 
 export function RoiCard({
@@ -16,7 +17,7 @@ export function RoiCard({
   const configured = entry.monthlySavingsUsd != null
   const { data: connections } = useConnectionsQuery()
   const connectionName =
-    connections?.find((c) => c.id === entry.connectionId)?.name || entry.connectionId
+    connections?.find((c: DatabaseConnection) => c.id === entry.connectionId)?.name || entry.connectionId
   return (
     <Card className={cn('p-4', !configured && 'opacity-75')}>
       <div className="space-y-2.5">
