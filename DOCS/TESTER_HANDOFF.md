@@ -16,7 +16,7 @@
 | Docker Desktop | 29.2.1+ |
 | Compose | v5.1.0+ (docker-compose v2 syntax works) |
 | Disk | ≥ 10 GB free (Postgres data + MLflow + images) |
-| Ports needed | 3000 (frontend), 5000 (mlflow), 5432 (app-db), 5433 (fault-lab-db), 8080 (backend) |
+| Ports needed | 3000 (frontend), 5000 (mlflow), 5432 (app-db), 5433 (fault-lab-db), 5434 (shadow-pool), 8080 (backend) |
 | Chrome / Firefox | latest, for the UI at http://localhost:3000 |
 
 Nothing needs to be installed globally other than Docker Desktop and Git.
@@ -76,6 +76,29 @@ If the tester wants to diff against upstream, these are the files touched. The A
 | File | What |
 |---|---|
 | `apps/backend/app/services/simulation_service.py` | `deploy_canary` short-circuits INSUFFICIENT_DATA when env `ZENTRIX_ALLOW_UNVERIFIED_DEPLOY=true` (demo-only bypass — B1 gap). `ALLOWED_CANARY_PATTERNS` accepts CREATE INDEX with or without CONCURRENTLY. Also `run_simulation` guards `None` metrics returned from shadow install failures. |
+
+### Arc A — Real shadow-pool (Model B verification)
+
+| File | What |
+|---|---|
+| `docker-compose.yml` | New `shadow-pool` service (persistent Postgres 16) + `shadow-pool-data` volume. Backend and shadow-lab-worker gain `depends_on: shadow-pool`. |
+| `apps/backend/app/tools/shadow_db_tool.py` | `provision_shadow_db` now `CREATE DATABASE shadow_<uuid>` on shadow-pool. `clone_customer_database` runs real `pg_dump \| pg_restore` between customer and shadow. `teardown_shadow_db` `DROP DATABASE`s on the pool. New `_drop_shadow_db` helper terminates lingering connections before DROP. Legacy fault-lab path preserved behind `SHADOW_DB_USE_FAULT_LAB=1` env. Legacy docker-in-docker path preserved behind `SHADOW_DB_USE_DOCKER=1`. |
+| `apps/backend/app/services/simulation_service.py` | `deploy_canary` logs a **WARN** the moment `ZENTRIX_ALLOW_UNVERIFIED_DEPLOY=true` widens the deployable set — impossible to miss in a prod log pipeline. |
+| `.env.example` | New `SHADOW_POOL_HOST/PORT/USER/PASSWORD/ADMIN_DB` block. `ZENTRIX_ALLOW_UNVERIFIED_DEPLOY` default flipped to `false`. |
+
+### Arc B — Closed-loop learning wired
+
+| File | What |
+|---|---|
+| `apps/backend/app/workers/canary_monitor.py` | New `_observed_p95_delta` + `_close_prediction_loop` helpers. Called from `execute_commit` AND `execute_rollback` before final DB commit. Writes `experiment.actual_latency_delta` from real production observation (not the shadow-predicted copy). Propagates to every linked `ModelPrediction.actual` + `absolute_error`. Unlocks `retrain_worker.compute_prediction_errors_and_calibration` producing real MAE numbers. |
+
+### Arc C — Fault-lab shipping gate + bandit graduation
+
+| File | What |
+|---|---|
+| `apps/backend/tests/e2e/test_fault_lab_e2e.py` | New pytest — for each of 6 canonical fault scenarios in `FAULT_MATRIX`, applies fault to `fault-lab-db`, runs full diagnosis pipeline, asserts `primary_root_cause` matches expected. Ship gate = ≥ 4/6 must pass. Skips cleanly when fault-lab-db unreachable. |
+| `apps/backend/app/ml/bandit/policy.py` | New `promote_phase_if_ready` — deterministic graduation gate. PHASE_1→2 at ≥50 labelled experiments; PHASE_2→3 at ≥200; PHASE_3→4 requires IPS offline eval pass. New `current_rollout_phase(db)` reads count of `ModelPrediction.actual is not None` and returns the current phase. |
+| `apps/backend/app/agents/graph_forecast.py` | `bandit` now takes `rollout_phase` from state (caller supplies); falls back to PHASE_1_RULE_BASED. |
 
 ### Docker & config
 
@@ -162,6 +185,16 @@ The elevated role Zentrix uses ONLY for DDL. Monitoring never touches it.
 ```powershell
 docker-compose exec -T app-db psql -U zentrix -d zentrix_db -c "CREATE ROLE zentrix_deployer WITH LOGIN PASSWORD 'deploy_dev_password'; GRANT USAGE, CREATE ON SCHEMA public TO zentrix_deployer; ALTER TABLE demo_orders OWNER TO zentrix_deployer;"
 ```
+
+### 3.6.1 Verify the shadow-pool is healthy (Arc A)
+
+```powershell
+docker-compose exec shadow-pool psql -U shadow_admin -d shadow_admin -c "SELECT current_database(), current_user, version();"
+```
+
+Should print the shadow-pool version and `current_user = shadow_admin`.
+No further seeding needed — the shadow-pool creates per-experiment
+`shadow_<uuid>` databases automatically on simulate.
 
 ### 3.7 Train the ML artifacts
 
@@ -315,6 +348,28 @@ Latest row should have `executed_by_role = 'deploy'` — confirms the split-role
 
 ---
 
+### 4.7 Verify the learning loop closed (Arc B)
+
+After the canary commits/rollbacks:
+
+```powershell
+docker-compose exec app-db psql -U zentrix -d zentrix_db -c "SELECT id, experiment_id, actual, absolute_error FROM model_predictions WHERE experiment_id IN (SELECT id FROM optimization_experiments WHERE status IN ('DEPLOYED', 'ROLLED_BACK')) ORDER BY created_at DESC LIMIT 5;"
+```
+
+Expected: at least one row with `actual` populated (not NULL) and
+`absolute_error` = |actual − prediction|. Confirms the retrain worker
+will now compute real MAE instead of `total_labeled=0`.
+
+### 4.8 Run the fault-lab shipping gate (Arc C)
+
+```powershell
+docker-compose exec backend python -m pytest apps/backend/tests/e2e/test_fault_lab_e2e.py -v
+```
+
+Expected: `test_shipping_gate_pass_rate` passes with ≥ 4/6 fault scenarios
+correctly diagnosed. Individual xfails are acceptable at this stage; a hard
+FAIL on the gate test means the diagnosis pipeline regressed.
+
 ## 5. Manual test matrix (structured checklist for the tester)
 
 Tick each row. If any fails, jump to section 7 (troubleshooting).
@@ -355,9 +410,13 @@ Tick each row. If any fails, jump to section 7 (troubleshooting).
 
 Blacklist matches substrings like ` users `, ` diagnoses `. If a customer DB legitimately has a `users` table, its slow queries silently drop from recommendations. Tracking: qualify by schema (`public.zentrix_*` prefix) or use a config-time list.
 
-### 6.4 Shadow DB doesn't have customer schema (B1)
+### 6.4 Shadow DB now has real customer schema (was B1 — FIXED in Arc A)
 
-Every simulate returns INSUFFICIENT_DATA because `CREATE INDEX ... ON demo_orders` fails against the bundled `fault-lab-db` (which has fault-lab schema, not customer schema). **The demo bypass flag `ZENTRIX_ALLOW_UNVERIFIED_DEPLOY=true` lets the click-through proceed.** Real fix: shadow-pool service + real `pg_dump | pg_restore` clone. This is the highest-priority next work.
+Model-B shadow-pool now creates a per-experiment `shadow_<uuid>` database,
+`pg_dump | pg_restore`s the customer schema into it, runs the paired workload,
+and DROPs the shadow on teardown. Verification produces real VERIFIED /
+REJECTED verdicts. `ZENTRIX_ALLOW_UNVERIFIED_DEPLOY` is now default false and
+should stay off — a WARN log fires in the backend the moment it's set true.
 
 ### 6.5 `ZENTRIX_ALLOW_UNVERIFIED_DEPLOY=true` must NOT ship to prod
 
@@ -375,13 +434,20 @@ Wrong for tests, dangerously misleading if a real non-monitoring connection is e
 
 Combined guards mute rollback for the first 30 s + until top query has ≥5 calls. A regression that manifests early gets 90 s of grace. Tracking: shorter warmup + call-count-based (not time-based) grace.
 
-### 6.9 `ModelPrediction.actual` never populated
+### 6.9 `ModelPrediction.actual` — FIXED in Arc B
 
-Retrain worker sees `total_labeled=0`, can never learn. Need to write `actual_latency_delta` into the linked ModelPrediction row on canary commit/rollback. Tracking: A4 in the sprint plan.
+Canary commit AND rollback now populate `experiment.actual_latency_delta`
+from the real production-observed p95 delta and propagate to every linked
+`ModelPrediction.actual` + `absolute_error`. Retrain worker will produce
+real MAE and drive drift detection.
 
-### 6.10 Bandit locked in PHASE_1_RULE_BASED
+### 6.10 Bandit graduation — FIXED in Arc C
 
-`graph_forecast` bandit never influences recommendations. Tracking: CHAIN 5 in `CLAUDE.md`.
+`promote_phase_if_ready` provides deterministic graduation: PHASE_1→2 at
+≥50 labelled experiments, PHASE_2→3 at ≥200, PHASE_3→4 gated by IPS eval
+pass. `graph_forecast` takes rollout_phase from caller state (which reads
+`current_rollout_phase(db)`). Advancement is monotonic — never regresses,
+never skips.
 
 ---
 
@@ -505,4 +571,4 @@ docker-compose exec backend grep -n '<TOKEN>' /workspace/apps/backend/<path>
 
 ## End of handoff
 
-If the tester runs sections 3 → 4 → 5 without hitting anything outside section 6/7, the demo is validated. If they hit something new, capture the log, note which section broke, and send back for the next session.
+If the tester runs sections 3 → 4 → 5 without hitting anything outside section 6/7, the demo is validated. This handoff covers Arc A (real shadow-pool), Arc B (closed-loop learning wired), and Arc C (fault-lab shipping gate + bandit graduation). If they hit something new, capture the log, note which section broke, and send back for the next session.

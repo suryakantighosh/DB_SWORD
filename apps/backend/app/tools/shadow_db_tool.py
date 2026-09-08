@@ -126,25 +126,86 @@ async def provision_shadow_db(
 ) -> ShadowDatabase:
     """Provision a shadow database.
 
-    Hackathon patch — Windows Docker Desktop cannot reliably let a
-    containerized backend spawn nested Postgres containers via docker.sock.
-    Route shadow experiments at the long-lived `fault-lab-db` compose
-    service (Postgres 16 + pg_stat_statements preloaded). Set
-    SHADOW_DB_USE_DOCKER=1 in .env to re-enable original Docker-based
-    provisioning.
+    Model B (default): connect to the long-lived `shadow-pool` Postgres and
+    `CREATE DATABASE shadow_<uuid>` for this experiment. Returns a
+    ShadowDatabase pointing at the new empty DB. Caller must call
+    `clone_customer_database` next to populate it, then `teardown_shadow_db`
+    on the returned `container_id` (which is the DB name, not a container id).
+
+    Legacy (opt-in via SHADOW_DB_USE_DOCKER=1): docker-in-docker container
+    per experiment — unreliable on Windows Docker Desktop.
+
+    Fallback (opt-in via SHADOW_DB_USE_FAULT_LAB=1): route at the
+    fault-lab-db service. Only useful for the pre-Model-B fault-lab
+    integration tests; leaves verification at INSUFFICIENT_DATA for any
+    customer schema not in fault-lab.
     """
     cfg = config or ShadowConfig()
     use_docker = os.getenv("SHADOW_DB_USE_DOCKER", "").lower() in {"1", "true", "yes"}
+    use_fault_lab = os.getenv("SHADOW_DB_USE_FAULT_LAB", "").lower() in {"1", "true", "yes"}
 
-    if not use_docker:
-        shadow_host = "fault-lab-db"  # compose service DNS name
+    # ---- Model B shadow-pool (default) ----
+    if not use_docker and not use_fault_lab:
+        pool_host = os.getenv("SHADOW_POOL_HOST", "shadow-pool")
+        pool_port = int(os.getenv("SHADOW_POOL_PORT", "5432"))
+        pool_user = os.getenv("SHADOW_POOL_USER", "shadow_admin")
+        pool_password = os.getenv("SHADOW_POOL_PASSWORD", "shadow_pool_dev_password")
+        pool_admin_db = os.getenv("SHADOW_POOL_ADMIN_DB", "shadow_admin")
+
+        shadow_db_name = f"shadow_{uuid.uuid4().hex[:12]}"
+        admin_dsn = (
+            f"postgresql://{pool_user}:{pool_password}@{pool_host}:{pool_port}/{pool_admin_db}"
+        )
+        shadow_dsn = (
+            f"postgresql://{pool_user}:{pool_password}@{pool_host}:{pool_port}/{shadow_db_name}"
+        )
+
+        logger.info(
+            "Provisioning shadow database on shadow-pool",
+            extra={"shadow_db_name": shadow_db_name, "host": pool_host, "port": pool_port},
+        )
+        # Connect to the admin DB and CREATE DATABASE. Uses autocommit because
+        # CREATE DATABASE cannot run inside a transaction block.
+        try:
+            admin_conn = await asyncpg.connect(admin_dsn, timeout=10.0)
+        except Exception as exc:
+            raise ShadowProvisioningError(
+                f"Cannot reach shadow-pool at {pool_host}:{pool_port}: {exc}"
+            ) from exc
+        try:
+            await admin_conn.execute(f'CREATE DATABASE "{shadow_db_name}"')
+        finally:
+            await admin_conn.close()
+
+        # Sanity: newly created DB should be immediately connectable.
+        ready = await wait_for_postgres_ready(shadow_dsn, timeout_seconds=10.0)
+        if not ready:
+            # Try to drop the orphan and raise.
+            await _drop_shadow_db(admin_dsn, shadow_db_name)
+            raise ShadowProvisioningError(
+                f"Shadow database {shadow_db_name} did not become ready in time"
+            )
+
+        return ShadowDatabase(
+            container_id=shadow_db_name,       # audit label — the DB name
+            container_name=f"shadow-pool/{shadow_db_name}",
+            port=pool_port,
+            dsn=shadow_dsn,
+            is_ready=True,
+        )
+
+    # ---- Fault-lab fallback (opt-in via SHADOW_DB_USE_FAULT_LAB=1) ----
+    if use_fault_lab:
+        shadow_host = "fault-lab-db"
         shadow_port = 5432
         dsn = (
             f"postgresql://fault_lab:fault_lab_dev_password"
             f"@{shadow_host}:{shadow_port}/fault_lab"
         )
-        logger.info(
-            f"Using bundled fault-lab-db as shadow: {shadow_host}:{shadow_port}"
+        logger.warning(
+            f"SHADOW_DB_USE_FAULT_LAB set — routing at bundled fault-lab-db "
+            f"({shadow_host}:{shadow_port}). Verification will INSUFFICIENT_DATA "
+            "for any customer schema not present in fault-lab."
         )
         return ShadowDatabase(
             container_id="fault-lab-static",
@@ -211,10 +272,31 @@ async def provision_shadow_db(
 
 
 async def teardown_shadow_db(container_id_or_name: str) -> bool:
-    """Stop and remove an ephemeral shadow database container."""
+    """Tear down a shadow environment.
+
+    Handles three shapes of `container_id_or_name`:
+      - "shadow_<hex>"        Model-B shadow-pool DB — DROP DATABASE on shadow-pool.
+      - "fault-lab-static"    Legacy pre-Model-B bypass — never removed.
+      - anything else         Legacy docker container name — `docker rm -f`.
+    """
+    # Model B: shadow-pool-managed named database.
+    if container_id_or_name.startswith("shadow_"):
+        pool_host = os.getenv("SHADOW_POOL_HOST", "shadow-pool")
+        pool_port = int(os.getenv("SHADOW_POOL_PORT", "5432"))
+        pool_user = os.getenv("SHADOW_POOL_USER", "shadow_admin")
+        pool_password = os.getenv("SHADOW_POOL_PASSWORD", "shadow_pool_dev_password")
+        pool_admin_db = os.getenv("SHADOW_POOL_ADMIN_DB", "shadow_admin")
+        admin_dsn = (
+            f"postgresql://{pool_user}:{pool_password}@{pool_host}:{pool_port}/{pool_admin_db}"
+        )
+        logger.info(f"Tearing down shadow database {container_id_or_name} on shadow-pool")
+        return await _drop_shadow_db(admin_dsn, container_id_or_name)
+
+    # Persistent bundled shadow — never remove.
     if container_id_or_name in {"fault-lab-static", "zentrix-fault-lab-db-1"}:
-        # Persistent bundled shadow — never remove.
         return True
+
+    # Legacy Docker-container teardown path.
     if not is_docker_available():
         return False
     logger.info(f"Tearing down shadow container: {container_id_or_name}")
@@ -234,11 +316,15 @@ async def teardown_shadow_db(container_id_or_name: str) -> bool:
 async def clone_customer_database(source_dsn: str, target_dsn: str) -> None:
     """Clone a customer PostgreSQL database into the fresh shadow database.
 
-    The client utilities are executed server-side and credentials are never
-    logged. A failed dump or restore aborts the experiment instead of falling
-    back to synthetic metrics.
+    Runs `pg_dump --format=custom | pg_restore` against the two DSNs over the
+    Docker network. Client binaries live in the backend image
+    (`postgresql-client` apt package). Credentials are never logged.
+    A failed dump or restore aborts the experiment instead of falling back
+    to synthetic metrics.
     """
-    if "fault_lab" in target_dsn.lower():
+    # Legacy skip — Model B shadow-pool DBs are named shadow_<uuid>, not fault_lab.
+    # Kept so SHADOW_DB_USE_FAULT_LAB=1 opt-in path still no-ops.
+    if "/fault_lab" in target_dsn.lower():
         logger.info(
             "clone_customer_database: skipping clone into static fault-lab shadow "
             "(target_dsn=%s)", target_dsn.split("@")[-1] if "@" in target_dsn else "<hidden>"

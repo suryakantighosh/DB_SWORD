@@ -36,6 +36,29 @@ services:
       timeout: 5s
       retries: 10
 
+  # ─── Shadow Pool (Model B — per-experiment named databases) ─────────────
+  # Long-lived Postgres 16 that hosts one database per active shadow
+  # experiment. On experiment start the backend `CREATE DATABASE shadow_<uuid>`
+  # and pg_dump | pg_restore the customer schema into it. On teardown the DB
+  # is DROPped. Replaces the earlier fault-lab-static bypass which had no
+  # customer schema and forced every verification to INSUFFICIENT_DATA.
+  shadow-pool:
+    image: postgres:16-alpine
+    command: ["postgres", "-c", "shared_preload_libraries=pg_stat_statements", "-c", "max_connections=200"]
+    environment:
+      POSTGRES_DB: shadow_admin
+      POSTGRES_USER: shadow_admin
+      POSTGRES_PASSWORD: shadow_pool_dev_password
+    ports:
+      - "5434:5432"
+    volumes:
+      - shadow-pool-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shadow_admin -d shadow_admin"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   # ─── Backend API ─────────────────────────────────────────────────────────
   backend:
     volumes:
@@ -54,6 +77,8 @@ services:
       SHADOW_DB_IMAGE: postgres:16-alpine
     depends_on:
       app-db:
+        condition: service_healthy
+      shadow-pool:
         condition: service_healthy
 
   # ─── Workers ─────────────────────────────────────────────────────────────
@@ -95,15 +120,12 @@ services:
       context: .
       dockerfile: infra/docker/worker.Dockerfile
     command: ["shadow"]
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
     env_file:
       - .env
-    environment:
-      SHADOW_DB_HOST: host.docker.internal
-      SHADOW_DB_IMAGE: postgres:16-alpine
     depends_on:
       app-db:
+        condition: service_healthy
+      shadow-pool:
         condition: service_healthy
 
   # ─── MLflow Tracking Server ──────────────────────────────────────────────
@@ -149,3 +171,4 @@ volumes:
   fault-lab-data:
   mlflow-artifacts:
   feature1-artifacts:
+  shadow-pool-data:

@@ -68,6 +68,74 @@ class RolloutPhase(str, enum.Enum):
     PHASE_4_OFFLINE_EVALUATED = "offline_evaluated"  # Bandit verified via IPS and live
 
 
+# ── Rollout graduation thresholds ────────────────────────────────────────────
+# Move from PHASE_1_RULE_BASED (bandit ignored) to PHASE_2_SUPERVISED as soon
+# as we have enough labelled outcomes for the supervised models to be trusted.
+# PHASE_3 (bandit runs in shadow, output logged not used) requires the
+# supervised layer to have proven itself. PHASE_4 (bandit live) requires an
+# offline IPS evaluation to have passed.
+PHASE_2_MIN_LABELLED_EXPERIMENTS = 50
+PHASE_3_MIN_LABELLED_EXPERIMENTS = 200
+PHASE_4_REQUIRES_IPS_PASS = True   # gate-only sentinel; IPS eval is external
+
+
+def promote_phase_if_ready(
+    current_phase: RolloutPhase,
+    labelled_experiment_count: int,
+    ips_offline_eval_passed: bool = False,
+) -> RolloutPhase:
+    """Advance the rollout phase when the gating threshold is met.
+
+    Never regresses. Never skips a phase. Deterministic — no ML, no RNG.
+
+    - PHASE_1_RULE_BASED  → PHASE_2_SUPERVISED     : need ≥ 50 labelled experiments
+    - PHASE_2_SUPERVISED  → PHASE_3_BANDIT_SHADOW  : need ≥ 200 labelled experiments
+    - PHASE_3_BANDIT_SHADOW → PHASE_4_OFFLINE_EVALUATED : IPS eval must have passed
+
+    A `labelled experiment` is an OptimizationExperiment whose linked
+    ModelPrediction has actual != NULL — i.e. the canary observation window
+    populated the outcome (Arc B). Without Arc B this count stays 0 and
+    graduation cannot advance.
+    """
+    if current_phase == RolloutPhase.PHASE_1_RULE_BASED:
+        if labelled_experiment_count >= PHASE_2_MIN_LABELLED_EXPERIMENTS:
+            return RolloutPhase.PHASE_2_SUPERVISED
+        return current_phase
+    if current_phase == RolloutPhase.PHASE_2_SUPERVISED:
+        if labelled_experiment_count >= PHASE_3_MIN_LABELLED_EXPERIMENTS:
+            return RolloutPhase.PHASE_3_BANDIT_SHADOW
+        return current_phase
+    if current_phase == RolloutPhase.PHASE_3_BANDIT_SHADOW:
+        if PHASE_4_REQUIRES_IPS_PASS and ips_offline_eval_passed:
+            return RolloutPhase.PHASE_4_OFFLINE_EVALUATED
+        return current_phase
+    return current_phase
+
+
+async def current_rollout_phase(db: Any) -> RolloutPhase:
+    """Read the current rollout phase from persistent state, applying any
+    outstanding auto-graduation based on labelled-experiment count.
+
+    Called from graph_forecast at bandit construction time. Failsafe: on any
+    error returns PHASE_1_RULE_BASED so the bandit output stays advisory.
+    """
+    try:
+        from sqlalchemy import func, select
+        from app.models.experiment import ModelPrediction
+
+        labelled = await db.scalar(
+            select(func.count()).select_from(ModelPrediction).where(
+                ModelPrediction.actual.is_not(None)
+            )
+        )
+        labelled = int(labelled or 0)
+        # Storage-free: assume phase advances monotonically from PHASE_1.
+        return promote_phase_if_ready(RolloutPhase.PHASE_1_RULE_BASED, labelled)
+    except Exception:
+        return RolloutPhase.PHASE_1_RULE_BASED
+
+
+
 def compute_reward(
     metrics_delta: Mapping[str, Any],
     action: str,

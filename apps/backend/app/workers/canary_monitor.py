@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.models.audit import AuditLog, CanaryRun
-from app.models.experiment import OptimizationExperiment
+from app.models.experiment import ModelPrediction, OptimizationExperiment
 from app.db.customer_db import customer_connection_manager
 from app.tools import pg_introspection
 
@@ -164,6 +164,74 @@ def generate_rollback_sql(canary_sql: str) -> str:
     return "/* ROLLBACK ACTION NOT REQUIRED */"
 
 
+
+
+def _observed_p95_delta(canary_run: "CanaryRun") -> float | None:
+    """Compute production-observed candidate_p95 - baseline_p95 in ms.
+
+    Returns None when either side is missing or zero — we don't want to
+    contaminate the ModelPrediction training set with placeholders.
+    """
+    base = (canary_run.baseline_metrics or {}).get("p95_ms")
+    curr = (canary_run.canary_metrics or {}).get("p95_ms")
+    if base is None or curr is None:
+        return None
+    try:
+        base_f = float(base)
+        curr_f = float(curr)
+    except (TypeError, ValueError):
+        return None
+    if base_f == 0.0 and curr_f == 0.0:
+        return None
+    return curr_f - base_f
+
+
+async def _close_prediction_loop(
+    canary_run: "CanaryRun",
+    experiment: "OptimizationExperiment",
+    db: "AsyncSession",
+    outcome: str,
+) -> None:
+    """Populate experiment.actual_latency_delta and ModelPrediction.actual.
+
+    Called from both execute_commit and execute_rollback with outcome=
+    "COMMIT" or "ROLLBACK". The observed delta feeds retrain_worker which
+    computes MAE and drives model-drift retraining. Without this, every
+    ModelPrediction row stays at actual=NULL and the closed-loop learning
+    story is theater.
+    """
+    observed = _observed_p95_delta(canary_run)
+    if observed is None:
+        logger.info(
+            "Skipping prediction-loop closure: no observed p95 delta available",
+            extra={"experiment_id": str(experiment.id), "outcome": outcome},
+        )
+        return
+
+    # Update the experiment's real observed delta (was previously a copy of
+    # the shadow-predicted delta from simulation_service).
+    experiment.actual_latency_delta = observed
+
+    # Propagate to every ModelPrediction row linked to this experiment.
+    stmt = select(ModelPrediction).where(ModelPrediction.experiment_id == experiment.id)
+    predictions = list((await db.scalars(stmt)).all())
+    for pred in predictions:
+        pred.actual = observed
+        try:
+            pred.absolute_error = abs(observed - float(pred.prediction))
+        except (TypeError, ValueError):
+            pred.absolute_error = None
+
+    logger.info(
+        "Prediction loop closed",
+        extra={
+            "experiment_id": str(experiment.id),
+            "outcome": outcome,
+            "observed_delta_ms": observed,
+            "predictions_updated": len(predictions),
+        },
+    )
+
 async def execute_rollback(
     canary_run: CanaryRun,
     experiment: OptimizationExperiment,
@@ -209,6 +277,11 @@ async def execute_rollback(
         timestamp=now,
     )
     db.add(audit_entry)
+
+    # Model-B / Arc B: close the learning loop before commit so the retrain
+    # worker sees actual != NULL on this experiment's ModelPrediction rows.
+    await _close_prediction_loop(canary_run, experiment, db, outcome="ROLLBACK")
+
     await db.commit()
 
 
@@ -241,6 +314,12 @@ async def execute_commit(
         timestamp=now,
     )
     db.add(audit_entry)
+
+    # Arc B: propagate observed delta into ModelPrediction.actual so the
+    # retrain worker's compute_prediction_errors_and_calibration produces
+    # real MAE numbers instead of total_labeled=0.
+    await _close_prediction_loop(canary_run, experiment, db, outcome="COMMIT")
+
     await db.commit()
 
 

@@ -476,7 +476,17 @@ class SimulationService:
 
         # 1. Hard Gate: Policy Engine Check
         _deployable = {"VERIFIED", "APPROVE"}
+        # SECURITY: ZENTRIX_ALLOW_UNVERIFIED_DEPLOY is a demo bypass. With Model-B
+        # shadow-pool live, verification should produce VERIFIED / REJECTED and
+        # this branch should almost never fire. If it does fire in production
+        # a WARN log makes the exception loud in your log pipeline.
         if os.getenv("ZENTRIX_ALLOW_UNVERIFIED_DEPLOY", "false").lower() == "true":
+            logger.warning(
+                "ZENTRIX_ALLOW_UNVERIFIED_DEPLOY=true — deployable_set widened to include "
+                "INSUFFICIENT_DATA. This bypass must not be set in production; every deploy "
+                "under this flag is unverified.",
+                extra={"experiment_id": str(experiment_id)},
+            )
             _deployable.add("INSUFFICIENT_DATA")
         if exp.policy_verdict not in _deployable:
             raise ValueError(

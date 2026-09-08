@@ -18,7 +18,7 @@ from typing import Any, TypedDict
 from langgraph.graph import END, StateGraph
 
 from app.core.logging import get_logger
-from app.ml.bandit.policy import ContextualThompsonSamplingBandit, RolloutPhase
+from app.ml.bandit.policy import ContextualThompsonSamplingBandit, RolloutPhase, current_rollout_phase
 from app.ml.forecasting.predict import predict as predict_forecasting
 
 logger = get_logger(__name__)
@@ -88,7 +88,13 @@ def strategy_selector_node(state: ForecastState) -> dict[str, Any]:
     }
 
     # Contextual bandit selection (gated)
-    bandit = ContextualThompsonSamplingBandit(rollout_phase=RolloutPhase.PHASE_1_RULE_BASED)
+    # Arc C: rollout phase is resolved by the caller (retrain_worker or the
+    # forecast route) via current_rollout_phase(db). state may carry a
+    # pre-resolved value; otherwise default to PHASE_1_RULE_BASED (advisory only).
+    _phase = state.get("rollout_phase") if isinstance(state, dict) else None
+    if not isinstance(_phase, RolloutPhase):
+        _phase = RolloutPhase.PHASE_1_RULE_BASED
+    bandit = ContextualThompsonSamplingBandit(rollout_phase=_phase)
     decision = bandit.select_action(context)
     action = decision["selected_action"]
 
