@@ -1,0 +1,151 @@
+services:
+  # ─── Application Database ────────────────────────────────────────────────
+  app-db:
+    image: postgres:16-alpine
+    command: ["postgres", "-c", "shared_preload_libraries=pg_stat_statements"]
+    environment:
+      POSTGRES_DB: zentrix_db
+      POSTGRES_USER: zentrix
+      POSTGRES_PASSWORD: zentrix_dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - app-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zentrix -d zentrix_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Isolated database used only by the Database Fault Laboratory.
+  fault-lab-db:
+    build:
+      context: .
+      dockerfile: infra/docker/fault-lab.Dockerfile
+    environment:
+      POSTGRES_DB: fault_lab
+      POSTGRES_USER: fault_lab
+      POSTGRES_PASSWORD: fault_lab_dev_password
+    ports:
+      - "5433:5432"
+    volumes:
+      - fault-lab-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fault_lab -d fault_lab"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ─── Backend API ─────────────────────────────────────────────────────────
+  backend:
+    volumes:
+      - feature1-artifacts:/workspace/apps/backend/.artifacts
+      - /var/run/docker.sock:/var/run/docker.sock
+    build:
+      context: .
+      dockerfile: infra/docker/backend.Dockerfile
+    ports:
+      - "8080:8000"
+
+    env_file:
+      - .env
+    environment:
+      SHADOW_DB_HOST: host.docker.internal
+      SHADOW_DB_IMAGE: postgres:16-alpine
+    depends_on:
+      app-db:
+        condition: service_healthy
+
+  # ─── Workers ─────────────────────────────────────────────────────────────
+  telemetry-collector:
+    build:
+      context: .
+      dockerfile: infra/docker/worker.Dockerfile
+    command: ["telemetry"]
+    env_file:
+      - .env
+    depends_on:
+      app-db:
+        condition: service_healthy
+
+  retrain-worker:
+    build:
+      context: .
+      dockerfile: infra/docker/worker.Dockerfile
+    command: ["retrain"]
+    env_file:
+      - .env
+    depends_on:
+      app-db:
+        condition: service_healthy
+
+  canary-monitor:
+    build:
+      context: .
+      dockerfile: infra/docker/worker.Dockerfile
+    command: ["canary"]
+    env_file:
+      - .env
+    depends_on:
+      app-db:
+        condition: service_healthy
+
+  shadow-lab-worker:
+    build:
+      context: .
+      dockerfile: infra/docker/worker.Dockerfile
+    command: ["shadow"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    env_file:
+      - .env
+    environment:
+      SHADOW_DB_HOST: host.docker.internal
+      SHADOW_DB_IMAGE: postgres:16-alpine
+    depends_on:
+      app-db:
+        condition: service_healthy
+
+  # ─── MLflow Tracking Server ──────────────────────────────────────────────
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.10.0
+    command:
+      [
+        "mlflow",
+        "server",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "5000",
+        "--backend-store-uri",
+        "sqlite:////mlflow/artifacts/mlflow.db",
+        "--default-artifact-root",
+        "/mlflow/artifacts",
+      ]
+    ports:
+      - "5000:5000"
+    env_file:
+      - infra/monitoring/mlflow.env
+    volumes:
+      - mlflow-artifacts:/mlflow/artifacts
+
+  # ─── Frontend ────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: .
+      dockerfile: infra/docker/frontend.Dockerfile
+      args:
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8080}
+        NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY:-}
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    depends_on:
+      - backend
+
+volumes:
+  app-db-data:
+  fault-lab-data:
+  mlflow-artifacts:
+  feature1-artifacts:
