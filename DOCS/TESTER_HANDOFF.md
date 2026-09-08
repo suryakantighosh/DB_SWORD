@@ -363,7 +363,7 @@ will now compute real MAE instead of `total_labeled=0`.
 ### 4.8 Run the fault-lab shipping gate (Arc C)
 
 ```powershell
-docker-compose exec backend python -m pytest apps/backend/tests/e2e/test_fault_lab_e2e.py -v
+docker-compose exec backend python -m pytest tests/e2e/test_fault_lab_e2e.py -v
 ```
 
 Expected: `test_shipping_gate_pass_rate` passes with ≥ 4/6 fault scenarios

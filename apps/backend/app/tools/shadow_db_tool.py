@@ -271,6 +271,34 @@ async def provision_shadow_db(
         raise
 
 
+
+
+async def _drop_shadow_db(admin_dsn: str, shadow_db_name: str) -> bool:
+    """Terminate active connections and DROP DATABASE on the shadow-pool.
+
+    Called both from provision_shadow_db (cleanup on wait_for_postgres_ready
+    timeout) and teardown_shadow_db (end-of-experiment).
+    """
+    try:
+        conn = await asyncpg.connect(admin_dsn, timeout=10.0)
+    except Exception as exc:
+        logger.warning(f"Cannot reach shadow-pool to drop {shadow_db_name}: {exc}")
+        return False
+    try:
+        # Boot any lingering connections to the shadow DB so DROP can proceed.
+        await conn.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE datname = $1 AND pid <> pg_backend_pid()",
+            shadow_db_name,
+        )
+        await conn.execute(f'DROP DATABASE IF EXISTS "{shadow_db_name}"')
+        return True
+    except Exception as exc:
+        logger.warning(f"Failed to DROP DATABASE {shadow_db_name}: {exc}")
+        return False
+    finally:
+        await conn.close()
+
 async def teardown_shadow_db(container_id_or_name: str) -> bool:
     """Tear down a shadow environment.
 
