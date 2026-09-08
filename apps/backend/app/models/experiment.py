@@ -160,6 +160,19 @@ class OptimizationExperiment(Base, TimestampMixin):
         nullable=False,
     )  # PENDING, SIMULATED, APPROVED, REJECTED, DEPLOYED, ROLLED_BACK
 
+    # Arc A: EXPLAIN (FORMAT JSON) plans captured against the shadow-pool
+    # workload query, before and after the candidate optimization was
+    # installed. Populated by shadow_lab_worker; nullable so historical rows
+    # and rows produced by paths that don't run shadow-pool stay valid.
+    explain_before: Mapped[Optional[Dict[str, Any]]] = mapped_column(
+        JSON,
+        nullable=True,
+    )
+    explain_after: Mapped[Optional[Dict[str, Any]]] = mapped_column(
+        JSON,
+        nullable=True,
+    )
+
     # Relationships
     connection: Mapped["DatabaseConnection"] = relationship(
         "DatabaseConnection",

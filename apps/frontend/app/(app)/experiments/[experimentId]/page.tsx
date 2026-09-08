@@ -180,6 +180,118 @@ export default function ExperimentDetailPage() {
           </div>
         </CardContent>
       </Card>
+
+      <ExplainDiffCard before={exp.explainBefore} after={exp.explainAfter} />
     </div>
+  );
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Arc A: EXPLAIN before/after side-by-side diff card.
+// Reads the plan JSON captured by shadow_lab_worker around the candidate
+// install and shows the two plans in monospace side-by-side, with a small
+// Total Cost delta pulled from Plan['Total Cost'] on each.
+// ────────────────────────────────────────────────────────────────────────
+function _extractTotalCost(plan: unknown): number | null {
+  if (!plan || typeof plan !== 'object') return null;
+  // Postgres EXPLAIN (FORMAT JSON) shape: [{ "Plan": { "Total Cost": ... } }].
+  const arr = Array.isArray(plan) ? plan : [plan];
+  const first = arr[0] as Record<string, unknown> | undefined;
+  const p = first && (first['Plan'] as Record<string, unknown> | undefined);
+  const cost = p && p['Total Cost'];
+  return typeof cost === 'number' ? cost : null;
+}
+
+function _formatPlan(plan: unknown): string {
+  if (plan == null) return '';
+  try {
+    return JSON.stringify(plan, null, 2);
+  } catch {
+    return String(plan);
+  }
+}
+
+function ExplainDiffCard({ before, after }: { before?: unknown; after?: unknown }) {
+  const hasBefore = before != null && before !== '';
+  const hasAfter = after != null && after !== '';
+
+  if (!hasBefore && !hasAfter) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>EXPLAIN before vs after</CardTitle>
+          <CardDescription>
+            No plan capture available for this experiment. The shadow-pool worker
+            records EXPLAIN plans around the candidate install; this card populates
+            once a shadow-pool run has completed.
+          </CardDescription>
+        </CardHeader>
+      </Card>
+    );
+  }
+
+  const costBefore = _extractTotalCost(before);
+  const costAfter = _extractTotalCost(after);
+  const delta =
+    costBefore != null && costAfter != null ? costAfter - costBefore : null;
+  const deltaPctVal =
+    costBefore != null && costAfter != null && costBefore > 0
+      ? ((costAfter - costBefore) / costBefore) * 100
+      : null;
+  const improved = delta != null && delta < 0;
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>EXPLAIN before vs after</CardTitle>
+        <CardDescription>
+          Planner cost + tree captured by the shadow-pool worker for the workload
+          query, before and after the candidate optimization was installed.
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        {delta != null && (
+          <div className="mb-3 flex flex-wrap items-baseline gap-4 text-xs">
+            <span className="text-muted-foreground">Total Cost</span>
+            <span className="font-mono">
+              before {costBefore?.toFixed(2) ?? '—'}
+            </span>
+            <span className="font-mono">
+              after {costAfter?.toFixed(2) ?? '—'}
+            </span>
+            <span
+              className={
+                improved
+                  ? 'font-mono font-medium text-success'
+                  : 'font-mono font-medium text-danger'
+              }
+            >
+              Δ {delta > 0 ? '+' : ''}
+              {delta.toFixed(2)}
+              {deltaPctVal != null && (
+                <span className="ml-1">
+                  ({deltaPctVal > 0 ? '+' : ''}
+                  {deltaPctVal.toFixed(1)}%)
+                </span>
+              )}
+            </span>
+          </div>
+        )}
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+          <div>
+            <div className="mb-1 text-xs font-medium text-muted-foreground">Before</div>
+            <pre className="max-h-96 overflow-auto rounded-md border border-border bg-muted/40 p-3 font-mono text-[11px] leading-relaxed">
+              {hasBefore ? _formatPlan(before) : '(no plan captured)'}
+            </pre>
+          </div>
+          <div>
+            <div className="mb-1 text-xs font-medium text-muted-foreground">After</div>
+            <pre className="max-h-96 overflow-auto rounded-md border border-border bg-muted/40 p-3 font-mono text-[11px] leading-relaxed">
+              {hasAfter ? _formatPlan(after) : '(no plan captured)'}
+            </pre>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
   );
 }

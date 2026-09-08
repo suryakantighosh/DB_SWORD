@@ -237,6 +237,9 @@ class SimulationService:
             success=is_verified,
             risk="LOW" if is_verified else "HIGH",
             status="SIMULATED",
+            # Arc A: EXPLAIN plans captured by shadow_lab_worker.
+            explain_before=experiment_results.get("explain_before"),
+            explain_after=experiment_results.get("explain_after"),
         )
 
         db.add(experiment)

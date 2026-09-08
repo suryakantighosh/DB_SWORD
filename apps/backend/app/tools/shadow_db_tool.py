@@ -394,13 +394,48 @@ async def clone_customer_database(source_dsn: str, target_dsn: str) -> None:
         raise ShadowProvisioningError(f"Shadow clone failed: {details[-2000:]}")
 
 
+async def _capture_explain_plan(
+    connection: asyncpg.Connection, query_text: str
+) -> dict[str, Any] | None:
+    """Best-effort EXPLAIN (FORMAT JSON) for the Arc A before/after diff card.
+
+    Returns the raw plan JSON (list-of-one shape from Postgres) or None on
+    any error. Deliberately does NOT run ANALYZE — the shadow-pool workload
+    already exercised the query, and ANALYZE mutations here would skew the
+    baseline vs candidate paired measurement.
+    """
+    if not query_text or not query_text.strip():
+        return None
+    stripped = query_text.strip().rstrip(";")
+    lower = stripped.lower()
+    # Only EXPLAIN read-only SELECT/WITH — matches pg_introspection's guard.
+    if not (lower.startswith("select") or lower.startswith("with")):
+        return None
+    try:
+        row = await connection.fetchval(f"EXPLAIN (FORMAT JSON) {stripped}")
+    except Exception as exc:  # noqa: BLE001 — capture is advisory, never blocks install
+        logger.warning("EXPLAIN capture failed for Arc A diff card: %s", exc)
+        return None
+    if isinstance(row, str):
+        import json
+        try:
+            row = json.loads(row)
+        except Exception:  # noqa: BLE001
+            return None
+    return row
+
+
 async def install_candidate_optimization(
     connection: asyncpg.Connection,
     candidate_sql: str,
+    workload_query: str | None = None,
 ) -> dict[str, Any]:
     """Execute a candidate optimization (DDL/config) against the shadow database.
 
-    Measures execution time and returns execution metadata.
+    Measures execution time and returns execution metadata. When
+    `workload_query` is provided, also captures EXPLAIN (FORMAT JSON) for
+    that query before and after the candidate install — the two plans feed
+    the Arc A EXPLAIN-diff card on the experiment detail page.
     """
     start_time = time.monotonic()
     cleaned = candidate_sql.strip()
@@ -410,15 +445,21 @@ async def install_candidate_optimization(
             "success": False,
             "duration_ms": 0.0,
             "error": "Candidate SQL is outside the supported index/statistics/vacuum action set",
+            "explain_before": None,
+            "explain_after": None,
         }
+    explain_before = await _capture_explain_plan(connection, workload_query) if workload_query else None
     try:
         await connection.execute(candidate_sql)
         duration_ms = (time.monotonic() - start_time) * 1000.0
+        explain_after = await _capture_explain_plan(connection, workload_query) if workload_query else None
         return {
             "candidate_sql": candidate_sql,
             "success": True,
             "duration_ms": duration_ms,
             "error": None,
+            "explain_before": explain_before,
+            "explain_after": explain_after,
         }
     except Exception as exc:
         duration_ms = (time.monotonic() - start_time) * 1000.0
@@ -428,6 +469,8 @@ async def install_candidate_optimization(
             "success": False,
             "duration_ms": duration_ms,
             "error": str(exc),
+            "explain_before": explain_before,
+            "explain_after": None,
         }
 
 

@@ -28,6 +28,8 @@ interface BackendExperiment {
   status: string;
   created_at: string;
   updated_at: string;
+  explain_before?: unknown | null;
+  explain_after?: unknown | null;
 }
 
 function strategyType(strategy: string): Recommendation['type'] {
@@ -96,6 +98,8 @@ function toExperiment(data: BackendExperiment): Experiment {
       ...((policy.violated_rules as string[] | undefined) || []).map((rule) => ({ rule, passed: false })),
     ],
     auditLog: [],
+    explainBefore: data.explain_before ?? undefined,
+    explainAfter: data.explain_after ?? undefined,
   };
 }
 

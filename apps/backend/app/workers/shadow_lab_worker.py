@@ -135,8 +135,24 @@ class ShadowLabWorker:
         # 1. Baseline workload replay
         baseline_metrics = await replay_workload(target_connection, workload, iterations=iterations)
 
-        # 2. Install candidate optimization
-        install_res = await install_candidate_optimization(target_connection, candidate_sql)
+        # 2. Install candidate optimization (also captures EXPLAIN before/after
+        #    for the Arc A diff card, using the first read query from the workload
+        #    as the representative workload_query).
+        workload_query_for_explain: str | None = None
+        for wl in workload:
+            if isinstance(wl, ReplayQuery) and not wl.is_write:
+                workload_query_for_explain = wl.query
+                break
+            if isinstance(wl, Mapping) and not wl.get("is_write", False):
+                workload_query_for_explain = str(wl.get("query", "")) or None
+                if workload_query_for_explain:
+                    break
+            if isinstance(wl, str):
+                workload_query_for_explain = wl
+                break
+        install_res = await install_candidate_optimization(
+            target_connection, candidate_sql, workload_query=workload_query_for_explain
+        )
         if not install_res["success"]:
             return {
                 "status": "FAILED",
@@ -144,6 +160,8 @@ class ShadowLabWorker:
                 "error": install_res["error"],
                 "baseline_metrics": baseline_metrics,
                 "candidate_metrics": None,
+                "explain_before": install_res.get("explain_before"),
+                "explain_after": install_res.get("explain_after"),
             }
 
         # 3. Candidate workload replay
@@ -193,6 +211,8 @@ class ShadowLabWorker:
             "storage_increase_ratio": float(storage_increase),
             "baseline_metrics": baseline_metrics,
             "candidate_metrics": candidate_metrics,
+            "explain_before": install_res.get("explain_before"),
+            "explain_after": install_res.get("explain_after"),
         }
 
     async def run_ephemeral_experiment(

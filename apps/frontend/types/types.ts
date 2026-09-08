@@ -225,6 +225,11 @@ export interface Experiment {
   policyChecks: PolicyCheck[]
   rollbackReason?: string
   auditLog: { actor: string; action: string; timeISO: string }[]
+  // Arc A: EXPLAIN (FORMAT JSON) plans captured by shadow_lab_worker
+  // before and after the candidate install. Raw pg shape:
+  // [{ "Plan": { "Node Type": "...", "Total Cost": 123.45, ... } }].
+  explainBefore?: unknown
+  explainAfter?: unknown
 }
 
 export interface ForecastPoint {

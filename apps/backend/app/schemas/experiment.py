@@ -125,6 +125,10 @@ class OptimizationExperimentBase(BaseModel):
     risk: str = "LOW"
     rollback: bool = False
     status: str = "PENDING"
+    # Arc A: EXPLAIN (FORMAT JSON) plans captured before/after the shadow
+    # candidate install. Raw pg output shape (list-of-one-plan-object).
+    explain_before: Optional[Any] = None
+    explain_after: Optional[Any] = None
 
 
 class OptimizationExperimentCreate(OptimizationExperimentBase):
