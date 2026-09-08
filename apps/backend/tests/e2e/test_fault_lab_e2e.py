@@ -105,7 +105,8 @@ async def test_diagnosis_matches_expected_root_cause(scenario_name: str, fault_l
         "plan_metrics": [],
         "timeline": [],
     }
-    report = await run_diagnosis(evidence)
+    # graph_diagnosis.run_diagnosis is SYNC (LangGraph .invoke). Do not await.
+    report = run_diagnosis(evidence)
     primary = report.get("primary_root_cause", "UNKNOWN")
 
     # Store the outcome on the item so the gate summary can total pass/fail.

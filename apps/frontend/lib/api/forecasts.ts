@@ -42,3 +42,28 @@ export const forecastsApi = {
     }
   },
 };
+
+// Arc C2 — Rollout phase state for the badge on /forecasts.
+export type RolloutPhaseSnapshot = {
+  current_phase: string;
+  labelled_experiments: number;
+  next_threshold: number;
+  progress_pct: number;
+  bandit_live: boolean;
+};
+
+export async function getRolloutPhase(): Promise<RolloutPhaseSnapshot> {
+  try {
+    const data = await apiClient.get<RolloutPhaseSnapshot>('/forecasts/rollout-phase');
+    return data;
+  } catch {
+    return {
+      current_phase: 'rule_based',
+      labelled_experiments: 0,
+      next_threshold: 50,
+      progress_pct: 0,
+      bandit_live: false,
+    };
+  }
+}
+

@@ -83,3 +83,59 @@ async def list_forecasts(
 ) -> Any:
     """List forecasts (empty until per-connection forecasts are materialized)."""
     return []
+
+
+# ── Arc C2 — Rollout phase state for the frontend badge ─────────────────────
+from app.ml.bandit.policy import (
+    RolloutPhase,
+    current_rollout_phase,
+    PHASE_2_MIN_LABELLED_EXPERIMENTS,
+    PHASE_3_MIN_LABELLED_EXPERIMENTS,
+)
+from sqlalchemy import func as _func, select
+from app.models.experiment import ModelPrediction as _ModelPrediction
+
+
+@router.get("/forecasts/rollout-phase")
+async def get_rollout_phase(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Deterministic rollout phase + progress toward the next graduation.
+
+    Frontend renders this as a small badge on the forecasts page. Never fails —
+    on any error returns PHASE_1_RULE_BASED with zeroed counters.
+    """
+    try:
+        current = await current_rollout_phase(db)
+        labelled = int(await db.scalar(
+            select(_func.count()).select_from(_ModelPrediction).where(
+                _ModelPrediction.actual.is_not(None)
+            )
+        ) or 0)
+    except Exception:
+        return {
+            "current_phase": RolloutPhase.PHASE_1_RULE_BASED.value,
+            "labelled_experiments": 0,
+            "next_threshold": PHASE_2_MIN_LABELLED_EXPERIMENTS,
+            "progress_pct": 0.0,
+            "advisory": True,
+            "bandit_live": False,
+        }
+
+    if current == RolloutPhase.PHASE_1_RULE_BASED:
+        next_threshold = PHASE_2_MIN_LABELLED_EXPERIMENTS
+    elif current == RolloutPhase.PHASE_2_SUPERVISED:
+        next_threshold = PHASE_3_MIN_LABELLED_EXPERIMENTS
+    else:
+        next_threshold = labelled
+
+    progress = min(100.0, (labelled / next_threshold) * 100.0) if next_threshold > 0 else 100.0
+    return {
+        "current_phase": current.value,
+        "labelled_experiments": labelled,
+        "next_threshold": next_threshold,
+        "progress_pct": round(progress, 1),
+        "bandit_live": current == RolloutPhase.PHASE_4_OFFLINE_EVALUATED,
+    }
+

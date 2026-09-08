@@ -15,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_connection_user, get_db_session
+from app.db.session import async_session_factory
 from app.db.customer_db import customer_connection_manager
 from app.models.approval import Approval
 from app.models.audit import CanaryRun
@@ -307,13 +308,19 @@ async def stream_canary_metrics(
     if not owned:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Canary run not found")
 
+    # Capture the id and connection ownership from the request-scoped session,
+    # then open a FRESH AsyncSession per tick inside the generator. SSE
+    # generators run in a nested anyio task context that doesn't share the
+    # request's SQLAlchemy greenlet plumbing — reusing the request session
+    # inside the loop causes MissingGreenlet crashes.
+    owned_id = owned.id
+
     async def event_generator() -> AsyncGenerator[dict, None]:
         while True:
-            # Expire cached rows so we don't replay the SQLAlchemy identity
-            # map — canary_monitor updates canary_metrics / status from the
-            # worker session and we need to see those writes here.
-            db.expire_all()
-            current = await db.scalar(select(CanaryRun).where(CanaryRun.id == owned.id))
+            async with async_session_factory() as tick_db:
+                current = await tick_db.scalar(
+                    select(CanaryRun).where(CanaryRun.id == owned_id)
+                )
             if not current:
                 return
             metrics = current.canary_metrics or {}

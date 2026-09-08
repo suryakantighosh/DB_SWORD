@@ -22,7 +22,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.logging import get_logger
-from app.ml.bandit.policy import ContextualThompsonSamplingBandit, RolloutPhase
+from app.ml.bandit.policy import (
+    ContextualThompsonSamplingBandit,
+    RolloutPhase,
+    current_rollout_phase,
+    promote_phase_if_ready,
+    PHASE_2_MIN_LABELLED_EXPERIMENTS,
+    PHASE_3_MIN_LABELLED_EXPERIMENTS,
+)
 from app.ml.forecasting.train import train as train_l1_forecasting
 from app.models.audit import AuditLog
 from app.models.experiment import BanditEvent, ModelPrediction, OptimizationExperiment
@@ -237,7 +244,14 @@ def evaluate_model_promotion(
 async def evaluate_bandit_promotion(
     db: AsyncSession,
 ) -> dict[str, Any]:
-    """Evaluate logged bandit decisions using Inverse Propensity Scoring (IPS)."""
+    """Evaluate logged bandit decisions with IPS and resolve rollout phase.
+
+    Arc C2: reads current_rollout_phase(db) (deterministic — based on count of
+    labelled experiments in ModelPrediction) and promotes to the next phase if
+    the IPS eval passes. The returned dict includes the resolved phase, the
+    counts driving it, and whether a promotion would fire — the FE reads
+    these fields to render the rollout-phase badge.
+    """
     stmt = select(BanditEvent).order_by(BanditEvent.created_at.desc()).limit(200)
     result = await db.execute(stmt)
     events = list(result.scalars().all())
@@ -252,10 +266,39 @@ async def evaluate_bandit_promotion(
         for ev in events
     ]
 
-    bandit = ContextualThompsonSamplingBandit()
+    # Resolve the current phase from labelled-experiment count (Arc B populates
+    # ModelPrediction.actual; Arc C2 counts non-null rows).
+    current_phase = await current_rollout_phase(db)
+
+    bandit = ContextualThompsonSamplingBandit(rollout_phase=current_phase)
     ips_report = bandit.evaluate_offline_ips(logged_events, min_effective_sample_size=10)
 
-    return ips_report
+    # Count labelled experiments explicitly for the FE badge progress bar.
+    from app.models.experiment import ModelPrediction
+    labelled_count = int(await db.scalar(
+        select(func.count()).select_from(ModelPrediction).where(
+            ModelPrediction.actual.is_not(None)
+        )
+    ) or 0)
+
+    # Only advance PHASE_3 -> PHASE_4 when IPS eval says the policy is safe.
+    ips_passed = bool(ips_report.get("policy_safe") or ips_report.get("is_verified"))
+    next_phase = promote_phase_if_ready(
+        current_phase,
+        labelled_experiment_count=labelled_count,
+        ips_offline_eval_passed=ips_passed,
+    )
+
+    return {
+        **ips_report,
+        "current_phase": current_phase.value,
+        "next_phase_if_promoted": next_phase.value,
+        "would_promote": next_phase != current_phase,
+        "labelled_experiments": labelled_count,
+        "phase_2_threshold": PHASE_2_MIN_LABELLED_EXPERIMENTS,
+        "phase_3_threshold": PHASE_3_MIN_LABELLED_EXPERIMENTS,
+        "ips_offline_eval_passed": ips_passed,
+    }
 
 
 async def run_retrain_cycle(
