@@ -39,7 +39,7 @@ approving, split-role deploying and observing an index end-to-end on a real Post
 
 <div align="center">
 
-# Zentrix.ai
+# DB_SWORD
 
 [![GitHub](https://img.shields.io/badge/GitHub-Source-black?logo=github)](https://github.com/subhankar235/Zentrix.ai)
 [![Live Demo](https://img.shields.io/badge/Live%20Demo-Try%20Now-brightgreen?logo=vercel)](https://zentrix-ai-bxlt.vercel.app/)
@@ -164,6 +164,7 @@ Six specialized LangGraph agents independently investigate database problems:
 - Statistical significance testing (p-values, confidence intervals)
 - Adversarial Skeptic agent challenges
 - Deterministic Policy engine safety gates
+<img width="1593" height="825" alt="Screenshot 2026-09-08 082010" src="https://github.com/user-attachments/assets/eb9e23c7-058b-4996-ab28-7751976ed56e" />
 
 ### 3. Predictive ML & Closed-Loop Learning
 
@@ -173,6 +174,7 @@ Six specialized LangGraph agents independently investigate database problems:
 - **Thompson Sampling** — contextual bandit for optimization strategy selection
 - **Evidently** — data and prediction drift monitoring
 - **MLflow** — experiment tracking and model registry
+<img width="1567" height="683" alt="Screenshot 2026-09-10 165825" src="https://github.com/user-attachments/assets/404882e4-10d4-430e-9bd4-1c27583a9c1c" />
 
 ### 4. Cost-to-Dollar ROI Translation
 
@@ -576,12 +578,21 @@ docker-compose up -d
 This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details..
 
 ---
+## Gallery
+<img width="1595" height="908" alt="Screenshot 2026-09-08 180857" src="https://github.com/user-attachments/assets/241f738f-1c17-4386-b285-c9adc6b9ccdf" />
+<img width="1586" height="893" alt="Screenshot 2026-09-08 180658" src="https://github.com/user-attachments/assets/00e059ed-147d-4c5c-8be5-df97f62c1fc6" />
+<img width="1615" height="896" alt="Screenshot 2026-09-08 183319" src="https://github.com/user-attachments/assets/741e0e66-5536-445c-9998-b6407cdc184c" />
+<img width="1615" height="861" alt="Screenshot 2026-09-07 214536" src="https://github.com/user-attachments/assets/cc55f78c-c483-4354-8768-fa00077ebc5f" />
+<img width="1597" height="891" alt="Screenshot 2026-09-08 183252" src="https://github.com/user-attachments/assets/adeda03c-63f8-4d53-ba9d-22a134659428" />
+
 
 <div align="center">
 
 **Built with precision for PostgreSQL intelligence**
 
-Zentrix.ai — From telemetry to transformation, with evidence at every step.
+
+
+DB_SWORD — From telemetry to transformation, with evidence at every step.
 
 [Backend](apps/backend/README.md) · [Frontend](apps/frontend/README.md) · [Architecture](DOCS/architecture.md)
 
